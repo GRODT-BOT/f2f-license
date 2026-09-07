@@ -1,0 +1,9 @@
+{
+  "name": "f2f-license",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Licence server for the Flat to Funded NinjaTrader strategy",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}
