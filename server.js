@@ -18,6 +18,14 @@
 //   DATA_DIR         where licences.json lives (default /data)
 //   MAX_MACHINES     computers allowed per licence (default 1)
 //   PORT             set by Railway
+//
+// Second product - "MNQ Hourly" (FlatToFundedHourly strategy). Completely
+// separate: its own licence file, its own FTH- keys, its own signing key and its
+// own verify endpoint, so a Flat to Funded key never unlocks the Hourly bot and
+// vice versa. Same admin page (switch product with the tabs at the top).
+//   RSA_PRIVATE_KEY_HOURLY  required for the Hourly product - PKCS#8 PEM
+//   MAX_MACHINES_HOURLY     computers per Hourly licence (default MAX_MACHINES)
+//   PRODUCT_HOURLY          product name in signed answers (default FlatToFundedHourly)
 // ---------------------------------------------------------------------------
 
 const http = require('http');
@@ -35,42 +43,58 @@ const DATA_DIR = process.env.DATA_DIR || '/data';
 const DB_FILE = path.join(DATA_DIR, 'licences.json');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
+const PRODUCTS = {
+  ftf: {
+    id: 'ftf', name: PRODUCT, label: 'Flat to Funded', prefix: 'FTF',
+    file: DB_FILE, privateKey: PRIVATE_KEY, maxMachines: MAX_MACHINES
+  },
+  hourly: {
+    id: 'hourly', name: process.env.PRODUCT_HOURLY || 'FlatToFundedHourly', label: 'MNQ Hourly', prefix: 'FTH',
+    file: path.join(DATA_DIR, 'licences-hourly.json'),
+    privateKey: (process.env.RSA_PRIVATE_KEY_HOURLY || '').replace(/\\n/g, '\n'),
+    maxMachines: parseInt(process.env.MAX_MACHINES_HOURLY || process.env.MAX_MACHINES || '1', 10)
+  }
+};
+
 if (!ADMIN_TOKEN) console.warn('WARNING: ADMIN_TOKEN not set - admin API is locked out.');
-if (!PRIVATE_KEY) console.warn('WARNING: RSA_PRIVATE_KEY not set - answers cannot be signed.');
+for (const p of Object.values(PRODUCTS))
+  if (!p.privateKey) console.warn('WARNING: no signing key for ' + p.label + ' - its answers cannot be signed.');
 
 // ---------------------------------------------------------------------------
-// storage
+// storage - one JSON file per product
 // ---------------------------------------------------------------------------
-let db = { nextId: 1, licences: [], checks: [] };
-let writing = Promise.resolve();
+for (const p of Object.values(PRODUCTS)) {
+  p.db = { nextId: 1, licences: [], checks: [] };
+  p.writing = Promise.resolve();
+}
 
-function loadDb() {
+function loadDb(p) {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    if (fs.existsSync(DB_FILE)) {
-      db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-      db.checks = db.checks || [];
-      console.log('loaded ' + db.licences.length + ' licences from ' + DB_FILE);
+    if (fs.existsSync(p.file)) {
+      p.db = JSON.parse(fs.readFileSync(p.file, 'utf8'));
+      p.db.checks = p.db.checks || [];
+      console.log('loaded ' + p.db.licences.length + ' ' + p.label + ' licences from ' + p.file);
     } else {
-      console.log('no licence file yet, starting empty at ' + DB_FILE);
+      console.log('no ' + p.label + ' licence file yet, starting empty at ' + p.file);
     }
   } catch (err) {
     // Never start with a blank slate over a file we failed to parse - that
     // would silently wipe every customer on the next save.
-    console.error('FATAL: could not read ' + DB_FILE, err);
+    console.error('FATAL: could not read ' + p.file, err);
     process.exit(1);
   }
 }
 
 // Serialised, atomic: write a temp file then rename, so a crash mid-write
 // cannot leave a truncated licence file behind.
-function saveDb() {
-  writing = writing.then(async () => {
-    const tmp = DB_FILE + '.tmp';
-    await fsp.writeFile(tmp, JSON.stringify(db, null, 2));
-    await fsp.rename(tmp, DB_FILE);
-  }).catch(err => console.error('save failed', err));
-  return writing;
+function saveDb(p) {
+  p.writing = p.writing.then(async () => {
+    const tmp = p.file + '.tmp';
+    await fsp.writeFile(tmp, JSON.stringify(p.db, null, 2));
+    await fsp.rename(tmp, p.file);
+  }).catch(err => console.error('save failed (' + p.label + ')', err));
+  return p.writing;
 }
 
 // ---------------------------------------------------------------------------
@@ -78,28 +102,28 @@ function saveDb() {
 // ---------------------------------------------------------------------------
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no I, O, 0, 1
 
-function newKey() {
+function newKey(prefix) {
   const g = [];
   for (let i = 0; i < 4; i++) {
     let s = '';
     for (let j = 0; j < 5; j++) s += ALPHABET[crypto.randomInt(ALPHABET.length)];
     g.push(s);
   }
-  return 'FTF-' + g.join('-');
+  return (prefix || 'FTF') + '-' + g.join('-');
 }
 
 // The exact string that gets signed. The C# side rebuilds this from the JSON
 // fields and verifies against it, so this order must never drift from the
 // strategy's BuildPayload().
-function payloadString(o) {
-  return [PRODUCT, o.key, o.machine, o.allowed ? '1' : '0',
+function payloadString(p, o) {
+  return [p.name, o.key, o.machine, o.allowed ? '1' : '0',
           o.expires || '', o.issued, o.nonce].join('|');
 }
 
-function sign(s) {
-  if (!PRIVATE_KEY) return '';
+function sign(p, s) {
+  if (!p.privateKey) return '';
   try {
-    return crypto.sign('sha256', Buffer.from(s, 'utf8'), PRIVATE_KEY).toString('base64');
+    return crypto.sign('sha256', Buffer.from(s, 'utf8'), p.privateKey).toString('base64');
   } catch (err) { console.error('signing failed', err); return ''; }
 }
 
@@ -135,15 +159,15 @@ function readBody(req) {
   });
 }
 
-function logCheck(entry) {
-  db.checks.unshift(entry);
-  if (db.checks.length > 500) db.checks.length = 500;
+function logCheck(p, entry) {
+  p.db.checks.unshift(entry);
+  if (p.db.checks.length > 500) p.db.checks.length = 500;
 }
 
 // ---------------------------------------------------------------------------
 // the endpoint the strategy calls
 // ---------------------------------------------------------------------------
-async function verify(req, res) {
+async function verify(req, res, p) {
   let body;
   try { body = await readBody(req); }
   catch (e) { return json(res, 400, { error: 'bad request' }); }
@@ -155,18 +179,18 @@ async function verify(req, res) {
   const nonce = crypto.randomBytes(12).toString('hex');
 
   const answer = (allowed, reason, expires) => {
-    const out = { product: PRODUCT, key, machine, allowed, expires: expires || '',
+    const out = { product: p.name, key, machine, allowed, expires: expires || '',
                   issued, nonce, reason };
-    out.signature = sign(payloadString(out));
-    logCheck({ at: issued, key, machine, version, allowed, reason });
-    saveDb();
+    out.signature = sign(p, payloadString(p, out));
+    logCheck(p, { at: issued, key, machine, version, allowed, reason });
+    saveDb(p);
     return json(res, 200, out);
   };
 
   if (!key) return answer(false, 'No licence key entered.');
   if (!machine) return answer(false, 'No machine id supplied.');
 
-  const lic = db.licences.find(l => l.key === key);
+  const lic = p.db.licences.find(l => l.key === key);
   if (!lic) return answer(false, 'Licence key not recognised.');
   if (!lic.active) return answer(false, 'This licence has been deactivated. Contact support.');
   if (lic.expiresAt && new Date(lic.expiresAt) < new Date())
@@ -176,7 +200,7 @@ async function verify(req, res) {
   const known = lic.machines.find(m => m.id === machine);
   if (known) {
     known.lastSeen = issued;
-  } else if (lic.machines.length >= MAX_MACHINES) {
+  } else if (lic.machines.length >= p.maxMachines) {
     return answer(false, 'This licence is already active on another computer. Contact support to move it.');
   } else {
     lic.machines.push({ id: machine, firstSeen: issued, lastSeen: issued });
@@ -190,7 +214,12 @@ async function verify(req, res) {
 // ---------------------------------------------------------------------------
 async function admin(req, res, url) {
   if (!isAdmin(req)) return json(res, 401, { error: 'unauthorized' });
-  const parts = url.pathname.split('/').filter(Boolean); // api admin licences [id] [action]
+  // /api/admin/licences[/id/action]          -> Flat to Funded (unchanged)
+  // /api/admin/hourly/licences[/id/action]   -> MNQ Hourly
+  let parts = url.pathname.split('/').filter(Boolean);
+  let p = PRODUCTS.ftf;
+  if (parts[2] === 'hourly') { p = PRODUCTS.hourly; parts = parts.slice(0, 2).concat(parts.slice(3)); }
+  const db = p.db;
 
   if (parts[2] === 'checks' && req.method === 'GET')
     return json(res, 200, { checks: db.checks.slice(0, 200) });
@@ -198,7 +227,7 @@ async function admin(req, res, url) {
   if (parts[2] !== 'licences') return json(res, 404, { error: 'not found' });
 
   if (req.method === 'GET' && parts.length === 3)
-    return json(res, 200, { licences: db.licences, maxMachines: MAX_MACHINES });
+    return json(res, 200, { product: p.id, label: p.label, licences: db.licences, maxMachines: p.maxMachines });
 
   if (req.method === 'POST' && parts.length === 3) {
     let body;
@@ -210,7 +239,7 @@ async function admin(req, res, url) {
     const days = body.days === null || body.days === '' ? null : parseInt(body.days, 10);
     const lic = {
       id: db.nextId++,
-      key: newKey(),
+      key: newKey(p.prefix),
       email,
       note: String(body.note || '').trim().slice(0, 200),
       active: true,
@@ -221,7 +250,7 @@ async function admin(req, res, url) {
       lastCheck: null
     };
     db.licences.unshift(lic);
-    await saveDb();
+    await saveDb(p);
     return json(res, 200, { licence: lic });
   }
 
@@ -235,7 +264,7 @@ async function admin(req, res, url) {
     else if (action === 'activate') lic.active = true;
     else if (action === 'reset-machine') lic.machines = [];
     else if (action === 'perpetual') lic.expiresAt = null;
-    else if (action === 'delete') db.licences = db.licences.filter(l => l.id !== id);
+    else if (action === 'delete') db.licences = p.db.licences = db.licences.filter(l => l.id !== id);
     else if (action === 'extend') {
       let body;
       try { body = await readBody(req); }
@@ -249,7 +278,7 @@ async function admin(req, res, url) {
       lic.expiresAt = new Date(from.getTime() + days * 86400000).toISOString();
     } else return json(res, 400, { error: 'unknown action' });
 
-    await saveDb();
+    await saveDb(p);
     return json(res, 200, { ok: true });
   }
 
@@ -320,7 +349,10 @@ const ADMIN_HTML = `<!doctype html>
          background:var(--accent);color:#06202a;padding:10px 20px;border-radius:8px;
          font-weight:650;box-shadow:0 8px 30px rgba(0,0,0,.5)}
   .empty{color:var(--dim);text-align:center;padding:34px}
-  @media(max-width:760px){ .hide-sm{display:none} main{padding:14px} }
+  .tabs{display:flex;gap:6px;margin-left:18px}
+  .tabs button{background:transparent;color:var(--dim);border:1px solid var(--line);font-weight:600}
+  .tabs button.on{background:var(--accent);color:#06202a;border-color:var(--accent)}
+  @media(max-width:760px){ .hide-sm{display:none} main{padding:14px} header{flex-wrap:wrap} .tabs{margin-left:0} }
 </style>
 </head>
 <body>
@@ -339,7 +371,11 @@ const ADMIN_HTML = `<!doctype html>
 <div id="app" hidden>
   <header>
     <div class="mark">F</div>
-    <h1>Flat to Funded<small>Licence administration</small></h1>
+    <h1>Flat to Funded<small id="sub">Licence administration</small></h1>
+    <nav class="tabs">
+      <button id="tab-ftf" onclick="setProduct('ftf')">Flat to Funded</button>
+      <button id="tab-hourly" onclick="setProduct('hourly')">MNQ Hourly</button>
+    </nav>
     <div style="margin-left:auto"><button class="ghost" onclick="signOut()">Sign out</button></div>
   </header>
 
@@ -380,6 +416,15 @@ const ADMIN_HTML = `<!doctype html>
 
 <script>
 let TOKEN = localStorage.getItem('f2f_admin_token') || '';
+let PRODUCT = localStorage.getItem('f2f_admin_product') || 'ftf';
+function base(){ return PRODUCT === 'hourly' ? '/api/admin/hourly' : '/api/admin'; }
+function setProduct(p){
+  PRODUCT = p; localStorage.setItem('f2f_admin_product', p);
+  document.getElementById('tab-ftf').className = p === 'ftf' ? 'on' : '';
+  document.getElementById('tab-hourly').className = p === 'hourly' ? 'on' : '';
+  document.getElementById('sub').textContent = (p === 'hourly' ? 'MNQ Hourly' : 'Flat to Funded') + ' · licence administration';
+  if (!document.getElementById('app').hidden) load();
+}
 
 function show(id, on){ document.getElementById(id).hidden = !on; }
 function toast(msg){
@@ -418,7 +463,7 @@ async function create(){
   const note  = document.getElementById('note').value.trim();
   document.getElementById('cerr').textContent = '';
   try {
-    const j = await api('/api/admin/licences', {method:'POST',
+    const j = await api(base() + '/licences', {method:'POST',
       body: JSON.stringify({email, days: days === '' ? null : days, note})});
     document.getElementById('email').value = '';
     document.getElementById('note').value = '';
@@ -428,7 +473,7 @@ async function create(){
   } catch(e){ document.getElementById('cerr').textContent = e.message; }
 }
 async function act(id, action, body){
-  try { await api('/api/admin/licences/' + id + '/' + action,
+  try { await api(base() + '/licences/' + id + '/' + action,
         {method:'POST', body: body ? JSON.stringify(body) : undefined});
         load(); } catch(e){ toast(e.message); }
 }
@@ -443,7 +488,7 @@ function ago(d){
 function copy(k){ navigator.clipboard.writeText(k).then(()=>toast('Copied ' + k)); }
 
 async function load(){
-  const j = await api('/api/admin/licences');
+  const j = await api(base() + '/licences');
   const tb = document.getElementById('rows');
   document.getElementById('count').textContent = j.licences.length;
   show('empty', j.licences.length === 0);
@@ -475,6 +520,7 @@ async function load(){
   }
 }
 
+setProduct(PRODUCT);
 if (TOKEN) { api('/api/admin/licences').then(()=>{ show('app',true); load(); })
                                        .catch(()=>{ show('gate',true); }); }
 else show('gate', true);
@@ -504,12 +550,14 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
   const p = url.pathname;
 
-  if (p === '/api/verify' && req.method === 'POST') return verify(req, res);
+  if (p === '/api/verify' && req.method === 'POST') return verify(req, res, PRODUCTS.ftf);
+  if (p === '/api/hourly/verify' && req.method === 'POST') return verify(req, res, PRODUCTS.hourly);
   if (p.startsWith('/api/admin/')) return admin(req, res, url).catch(err => {
     console.error(err); json(res, 500, { error: 'server error' });
   });
   if (p === '/health') return json(res, 200, { ok: true, product: PRODUCT,
-                                               licences: db.licences.length });
+                                               licences: PRODUCTS.ftf.db.licences.length,
+                                               hourlyLicences: PRODUCTS.hourly.db.licences.length });
   if (p === '/' || p === '/admin' || p === '/admin.html') {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     return res.end(ADMIN_HTML);
@@ -517,5 +565,5 @@ const server = http.createServer((req, res) => {
   return serveStatic(res, p);
 });
 
-loadDb();
+for (const prod of Object.values(PRODUCTS)) loadDb(prod);
 server.listen(PORT, () => console.log('licence server listening on ' + PORT));
