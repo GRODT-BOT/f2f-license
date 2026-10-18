@@ -263,6 +263,16 @@ function countsFor(username) {
 // WhatsApp notifications - best effort, never blocks a response
 function notify(text) {
   try {
+    const tgTok = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+    const tgChat = (process.env.TELEGRAM_CHAT_ID || '').trim();
+    if (tgTok && tgChat) {
+      const u = 'https://api.telegram.org/bot' + tgTok + '/sendMessage?chat_id=' +
+                encodeURIComponent(tgChat) + '&text=' + encodeURIComponent(text);
+      const rq = require('https').get(u, { timeout: 8000 }, r => r.resume());
+      rq.on('timeout', () => rq.destroy());
+      rq.on('error', e => console.error('notify(telegram):', e.message));
+      return;
+    }
     const phone = (process.env.CALLMEBOT_PHONE || '').trim();
     const key = (process.env.CALLMEBOT_APIKEY || '').trim();
     if (phone && key) {
