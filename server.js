@@ -2148,6 +2148,10 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     return res.end(ADMIN_HTML);
   }
+  if (p === '/mirror' || p === '/mirror/' || p === '/mirror.html') {
+    // Flat to Funded Mirror: weekly copy-trading subscription page (Stripe checkout)
+    return serveStatic(res, 'mirror.html');
+  }
   if (p === '/partner' || p === '/partner.html') {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     return res.end(PARTNER_HTML);
